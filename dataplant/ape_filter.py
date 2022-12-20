@@ -2,6 +2,7 @@
 from copy import deepcopy
 import multiprocessing as multi
 import os
+import random
 import subprocess
 
 from sacremoses import MosesTokenizer
@@ -21,34 +22,42 @@ def tokenize(
     proced_info: dict, corpus_info: dict, line: dict,
 ):
     """Tokenize given texts."""
-    if "tokenization" in proced_info:
-        for data_name in corpus_info:
-            tok_script = proced_info["tokenization"]["German script"]
-            if data_name == "source":
-                tok_script = proced_info["tokenization"]["English script"]
-            line[data_name] = tok_script.tokenize(
-                line[data_name], return_str=True, escape=False)
+    for data_name in corpus_info:
+        tok_script = proced_info["tokenization"]["German script"]
+        if data_name == "source":
+            tok_script = proced_info["tokenization"]["English script"]
+        line[data_name] = tok_script.tokenize(
+            line[data_name], return_str=True, escape=False)
 
 
 def divide_into_subword_units(
     proced_info: dict, corpus_info: dict, line: dict,
 ):
     """Divide tokens into subword units."""
-    if "subword segmentation" in proced_info:
-        for data_name in corpus_info:
-            seg_sys = proced_info["subword segmentation"]["system"]
-            line[data_name] = seg_sys.encode(
-                line[data_name], out_type=str)
+    for data_name in corpus_info:
+        seg_sys = proced_info["subword segmentation"]["system"]
+        line[data_name] = seg_sys.encode(
+            line[data_name], out_type=str)
 
 
 def concat_input(proced_info: dict, line: dict):
     """Concatenate a source text and its machine translation."""
-    if "input concatenation" in proced_info:
-        line["source"] = [
-            *line["source"],
-            "<s>",
-            *line["mach_trans"],
-        ]
+    line["source"] = [
+        *line["source"],
+        "<s>",
+        *line["mach_trans"],
+    ]
+
+
+def draw_out_samples(lines: list[dict], sample_size: int):
+    """Draw out only a few samples."""
+    shuffled_ind = list(range(len(lines)))
+    random.shuffle(shuffled_ind)
+    sampled_ind = shuffled_ind[:sample_size]
+    samples = []
+    for ind in sampled_ind:
+        samples.append(lines[ind])
+    return samples
 
 
 def process_corpus(
@@ -63,8 +72,10 @@ def process_corpus(
         for data_name in corpus_info:
             if len(line[data_name]) < 1:
                 break
-        tokenize(proced_info, corpus_info, line)
-        divide_into_subword_units(proced_info, corpus_info, line)
+        if "tokenization" in proced_info:
+            tokenize(proced_info, corpus_info, line)
+        if "subword segmentation" in proced_info:
+            divide_into_subword_units(proced_info, corpus_info, line)
         if "length control" in proced_info:
             max_len = proced_info["length control"]["max"]
             too_long = False
@@ -74,21 +85,40 @@ def process_corpus(
                     break
             if too_long:
                 continue
-        concat_input(proced_info, line)
+        if "input concatenation" in proced_info:
+            concat_input(proced_info, line)
         writ_que.put(line)
     writ_que.put(None)
 
 
-def record(writ_que: multi.Queue, out_files: dict):
+def record(writ_que: multi.Queue, out_files: dict, proced_info: dict):
     """Write out data."""
-    while True:
-        line = writ_que.get()
-        if line is None:
-            break
-        for data_name, out_file in out_files.items():
-            writ_text = " ".join(line[data_name]) + "\n"
-            out_file.write(writ_text)
-            out_file.flush()
+    if "draw out samples" in proced_info:
+        lines = []
+        while True:
+            line = writ_que.get()
+            lines.append(line)
+            if line is None:
+                break
+        sample_size = proced_info["draw out samples"]["size"]
+        samples = draw_out_samples(lines, sample_size)
+        for line in samples:
+            for data_name, out_file in out_files.items():
+                if not isinstance(line[data_name], str):
+                    writ_text = " ".join(line[data_name]) + "\n"
+                else:
+                    writ_text = line[data_name] + "\n"
+                out_file.write(writ_text)
+                out_file.flush()
+    else:
+        while True:
+            line = writ_que.get()
+            if line is None:
+                break
+            for data_name, out_file in out_files.items():
+                writ_text = " ".join(line[data_name]) + "\n"
+                out_file.write(writ_text)
+                out_file.flush()
 
 
 class APEFilter:
@@ -132,6 +162,9 @@ class APEFilter:
                 self.proced_info[proced_name]["system"] = subword_system
             elif proced_name == "length control":
                 self.proced_info[proced_name]["max"] = self.var_opt["max_len"]
+            elif proced_name == "draw out samples":
+                self.proced_info[proced_name]["size"] = (
+                    self.var_opt["sample_size"])
 
         buff_dir_list = []
         for buff_name in ["input", "output"]:
@@ -192,7 +225,12 @@ class APEFilter:
 
             writ_proc = multi.Process(
                 target=record,
-                args=(self.writ_queues[i], self.out_buff[i]))
+                args=(
+                    self.writ_queues[i],
+                    self.out_buff[i],
+                    self.proced_info,
+                ),
+            )
             writ_proc.start()
             writ_processes.append(writ_proc)
 
