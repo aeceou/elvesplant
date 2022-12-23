@@ -97,9 +97,9 @@ def record(writ_que: multi.Queue, out_files: dict, proced_info: dict):
         lines = []
         while True:
             line = writ_que.get()
-            lines.append(line)
             if line is None:
                 break
+            lines.append(line)
         sample_size = proced_info["draw out samples"]["size"]
         samples = draw_out_samples(lines, sample_size)
         for line in samples:
