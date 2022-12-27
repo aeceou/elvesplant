@@ -140,6 +140,10 @@ class APEFilter:
 
         self.var_opt = self.info["var_opt"]
         self.num_threads = self.var_opt.get("num_threads", 1)
+        corpus_len = len(self.corpus)
+        if corpus_len % self.num_threads != 0:
+            self.extra_split = True
+            self.num_threads += 1
         queue_size = self.var_opt.get("queue_size", 1)
         self.read_queues = [
             multi.Queue(maxsize=queue_size)
@@ -177,7 +181,11 @@ class APEFilter:
         for data_name, detail_info in self.corpus.info.items():
             for buff_dir_path in buff_dir_list:
                 os.makedirs(f"{buff_dir_path}/{data_name}", exist_ok=True)
-            split_size = len(self.corpus) // self.num_threads
+            if self.extra_split:
+                num_threads = self.num_threads - 1
+            else:
+                num_threads = self.num_threads
+            split_size = len(self.corpus) // num_threads
             in_file_path = detail_info["file_path"]
             in_file_dir = f"{buff_dir_list[0]}/{data_name}"
             comm_str = (
