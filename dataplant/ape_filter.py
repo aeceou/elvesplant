@@ -4,7 +4,9 @@ import multiprocessing as multi
 import os
 import random
 import subprocess
+import time
 
+from sacrebleu.metrics import TER
 from sacremoses import MosesTokenizer
 from sentencepiece import SentencePieceProcessor
 
@@ -22,31 +24,63 @@ def tokenize(
     proced_info: dict, corpus_info: dict, line: dict,
 ):
     """Tokenize given texts."""
+    tok_info = proced_info["tokenization"]
     for data_name in corpus_info:
-        tok_script = proced_info["tokenization"]["German script"]
         if data_name == "source":
-            tok_script = proced_info["tokenization"]["English script"]
+            tok_script = tok_info["source language"]
+        else:
+            tok_script = tok_info["target language"]
         line[data_name] = tok_script.tokenize(
             line[data_name], return_str=True, escape=False)
+
+
+def cleanse_1(
+    proced_info: dict, corpus_info: dict, line: dict,
+):
+    """Cleanse data of low quality (Shin et al., 2021).
+    
+    URL: https://doi.org/10.1145/3465383
+    """
+    detail_info = proced_info["cleansing (Shin et al., 2021)"]
+    copied_line = deepcopy(line)
+    for data_name in corpus_info:
+        copied_line[data_name] = list(line[data_name].split())
+        if len(copied_line[data_name]) > detail_info["max_len"]:
+            return False
+    if len(copied_line["target"]) == 0:
+        return False
+    else:
+        len_ratio = (
+            len(copied_line["mach_trans"])
+            / len(copied_line["target"]))
+        if detail_info["len_ratio"] < 1:
+            detail_info["len_ratio"] = 1 / detail_info["len_ratio"]
+        if (
+            len_ratio > detail_info["len_ratio"]
+            or len_ratio < (1 / detail_info["len_ratio"])
+        ):
+            return False
+    calc = detail_info["TER calculator"]
+    mach_trans = [line["mach_trans"]]
+    target= [[line["target"]]]
+    if calc.corpus_score(mach_trans, target).score > detail_info["max_ter"]:
+        return False
+    return True
 
 
 def divide_into_subword_units(
     proced_info: dict, corpus_info: dict, line: dict,
 ):
     """Divide tokens into subword units."""
+    seg_sys = proced_info["subword segmentation"]["system"]
     for data_name in corpus_info:
-        seg_sys = proced_info["subword segmentation"]["system"]
         line[data_name] = seg_sys.encode(
             line[data_name], out_type=str)
 
 
-def concat_input(proced_info: dict, line: dict):
+def concat_input(line: dict):
     """Concatenate a source text and its machine translation."""
-    line["source"] = [
-        *line["source"],
-        "<s>",
-        *line["mach_trans"],
-    ]
+    line["concat"] = [*line["source"], "<s>", *line["mach_trans"]]
 
 
 def draw_out_samples(lines: list[dict], sample_size: int):
@@ -69,26 +103,33 @@ def process_corpus(
         line = read_que.get()
         if line is None:
             break
-        for data_name in corpus_info:
-            if len(line[data_name]) < 1:
-                break
         if "tokenization" in proced_info:
             tokenize(proced_info, corpus_info, line)
+        if "cleansing (Shin et al., 2021)" in proced_info:
+            clean = cleanse_1(proced_info, corpus_info, line)
+            if not clean:
+                continue
         if "subword segmentation" in proced_info:
             divide_into_subword_units(proced_info, corpus_info, line)
         if "length control" in proced_info:
+            min_len = proced_info["length control"]["min"]
             max_len = proced_info["length control"]["max"]
-            too_long = False
+            too_short, too_long = False, False
             for data_name in corpus_info:
-                if len(line[data_name]) > max_len:
+                if len(line[data_name]) < min_len:
+                    too_short = True
+                    break
+                elif len(line[data_name]) > max_len:
                     too_long = True
                     break
-            if too_long:
+            if too_short or too_long:
                 continue
         if "input concatenation" in proced_info:
-            concat_input(proced_info, line)
+            concat_input(line)
         writ_que.put(line)
     writ_que.put(None)
+    while not writ_que.empty():
+        time.sleep(0.001)
 
 
 def record(writ_que: multi.Queue, out_files: dict, proced_info: dict):
@@ -141,8 +182,9 @@ class APEFilter:
         self.var_opt = self.info["var_opt"]
         self.num_threads = self.var_opt.get("num_threads", 1)
         corpus_len = len(self.corpus)
+        extra_split = False
         if corpus_len % self.num_threads != 0:
-            self.extra_split = True
+            extra_split = True
             self.num_threads += 1
         queue_size = self.var_opt.get("queue_size", 1)
         self.read_queues = [
@@ -153,19 +195,30 @@ class APEFilter:
             for i in range(self.num_threads)]
 
         self.proced_info = {}
+        to_concat_input = False
         for proced_name in self.var_opt["to_do"]:
             self.proced_info[proced_name] = {}
             if proced_name == "tokenization":
+                lang_pair = self.corpus_info.get(
+                    "lang_pair", ("en", "de"))
                 self.proced_info[proced_name] = {
-                    "English script": MosesTokenizer("en"),
-                    "German script": MosesTokenizer("de"),
+                    "source language": MosesTokenizer(lang_pair[0]),
+                    "target language": MosesTokenizer(lang_pair[1]),
                 }
+            elif proced_name == "cleansing (Shin et al., 2021)":
+                self.proced_info[proced_name]["TER calculator"] = TER()
+                for opt, value in self.var_opt["cleansing"].items():
+                    self.proced_info[proced_name][opt] = value
             elif proced_name == "subword segmentation":
                 sys_path = self.var_opt["sentencepiece"]["sys_path"]
                 subword_system = SentencePieceProcessor(model_file=sys_path)
                 self.proced_info[proced_name]["system"] = subword_system
             elif proced_name == "length control":
+                self.proced_info[proced_name]["min"] = self.var_opt.get(
+                    "min_len", 1)
                 self.proced_info[proced_name]["max"] = self.var_opt["max_len"]
+            elif proced_name == "input concatenation":
+                to_concat_input = True
             elif proced_name == "draw out samples":
                 self.proced_info[proced_name]["size"] = (
                     self.var_opt["sample_size"])
@@ -177,31 +230,35 @@ class APEFilter:
             buff_dir_list.append(buff_dir_path)
         self.buff_dir_list = buff_dir_list
         self.split_path = {}
-
-        for data_name, detail_info in self.corpus.info.items():
+        num_slices = corpus_len
+        for i, (data_name, detail_info)\
+            in enumerate(self.corpus.info.items()):
             for buff_dir_path in buff_dir_list:
                 os.makedirs(f"{buff_dir_path}/{data_name}", exist_ok=True)
-            if self.extra_split:
+            if extra_split:
                 num_threads = self.num_threads - 1
             else:
                 num_threads = self.num_threads
-            split_size = len(self.corpus) // num_threads
+            slice_size = corpus_len // num_threads
             in_file_path = detail_info["file_path"]
-            in_file_dir = f"{buff_dir_list[0]}/{data_name}"
+            in_buff_dir = f"{buff_dir_list[0]}/{data_name}"
             comm_str = (
-                f"split -l {split_size} "
-                f"{in_file_path} {in_file_dir}/")
+                f"split -l {slice_size} "
+                f"{in_file_path} {in_buff_dir}/")
             shell_proc = subprocess.run(
                 comm_str.split(),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 check=True, text=True)
-            print(shell_proc.stderr)
-            file_list = os.listdir(in_file_dir)
-            self.split_path[data_name] = file_list
+            if len(shell_proc.stderr) > 0:
+                print(shell_proc.stderr)
+            slice_paths = os.listdir(in_buff_dir)
+            self.split_path[data_name] = slice_paths
+            if i == 0:
+                num_slices = len(slice_paths)
 
         self.out_buff = []
-        for i in range(len(file_list)):
+        for i in range(num_slices):
             out_file_dict = {}
             for data_name in self.corpus.info:
                 out_file_name = os.path.basename(
@@ -210,6 +267,17 @@ class APEFilter:
                     f"{buff_dir_list[1]}/"
                     f"{data_name}/{out_file_name}")
                 out_file_dict[data_name] = open(
+                    out_path, "w", encoding="utf-8")
+            if to_concat_input:
+                data_name = "concat"
+                os.makedirs(
+                    f"{buff_dir_list[1]}/{data_name}", exist_ok=True)
+                out_file_name = os.path.basename(
+                    self.split_path["source"][i])
+                out_path = (
+                    f"{buff_dir_list[1]}/"
+                    f"{data_name}/{out_file_name}")
+                out_file_dict["concat"] = open(
                     out_path, "w", encoding="utf-8")
             self.out_buff.append(out_file_dict)
 
